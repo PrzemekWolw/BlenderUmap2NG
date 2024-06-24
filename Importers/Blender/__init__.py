@@ -12,8 +12,8 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 bl_info = {
-    "name" : "BlenderUmap",
-    "author" : "Amrsatrio, MountainFlash (MinshuG)",
+    "name" : "BlenderUmap NG",
+    "author" : "Amrsatrio, MountainFlash (MinshuG), Car_Killer",
     "description" : "",
     "blender" : (2, 80, 0),
     "version" : (0, 0, 1),
@@ -27,11 +27,14 @@ bl_info = {
 # auto_load.init()
 from . import main
 from . import settings
+from . import uefn
 
-modules = [main, settings]
+modules = [main, settings, uefn]
 
 def register():
+    import importlib
     for m in modules:
+        importlib.reload(m)
         m.register()
 
 def unregister():

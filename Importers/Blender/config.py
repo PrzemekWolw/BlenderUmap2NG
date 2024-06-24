@@ -42,6 +42,7 @@ def aeskeys_from_list(x: Any) -> List[T]:
 class Config:
     PaksDirectory: str
     ExportPath: str
+    MappingsPath: str
     UEVersion: str
     EncryptionKeys: List[Any]
     bDumpAssets: bool
@@ -57,8 +58,13 @@ class Config:
         sc = bpy.context.scene
         self.PaksDirectory = sc.Game_Path
         self.ExportPath = sc.exportPath
+        self.MappingsPath = sc.mappings_path
+        self.Platform = sc.ue_platform
         self.bUseCustomEngineVer = sc.bUseCustomEngineVer
         self.CustomVersion = sc.customEngineVer
+        self.bUseOverridePackageVersions = sc.bOverridePackageVersion
+        self.OverrideUE4 = sc.overridePackageVersionUE4
+        self.OverrideUE5 = sc.overridePackageVersionUE5
         self.UEVersion = sc.ue4_versions
         self.EncryptionKeys = sc.dpklist
         self.bDumpAssets = sc.bdumpassets
@@ -67,6 +73,7 @@ class Config:
         self.bExportToDDSWhenPossible = sc.bExportToDDSWhenPossible
         self.bExportBuildingFoundations = sc.bExportBuildingFoundations
         self.bExportHiddenObjects = sc.bExportHiddenObjects
+        self.bExportLandscapeOnly = sc.bExportLandscapeOnly
         self.ExportPackage = sc.package
         self.Textures = textures_to_mapping(sc)
         self.CustomOptions = sc.custom_options
@@ -74,12 +81,17 @@ class Config:
     def to_dict(self) -> dict:
         result: dict = {"PaksDirectory": self.PaksDirectory,
                         "ExportPath": self.ExportPath,
+                        "MappingsPath": self.MappingsPath,
+                        "Platform": self.Platform,
                         "UEVersion": self.CustomVersion if self.bUseCustomEngineVer else self.UEVersion,
+                        "bUsePackageVersion": self.bUseOverridePackageVersions,
+                        "FileVersion": { "FileVersionUE4": self.OverrideUE4, "FileVersionUE5": self.OverrideUE5 },
                         "bDumpAssets": self.bDumpAssets, "ObjectCacheSize": self.ObjectCacheSize,
                         "bReadMaterials": self.bReadMaterials,
                         "bExportToDDSWhenPossible": self.bExportToDDSWhenPossible,
                         "bExportBuildingFoundations": self.bExportBuildingFoundations,
                         "bExportHiddenObjects": self.bExportHiddenObjects,
+                        "bExportLandscapeOnly": self.bExportLandscapeOnly,
                         "ExportPackage": self.ExportPackage,
                         "EncryptionKeys": aeskeys_from_list(self.EncryptionKeys),
                         "Textures": textures_to_mapping(bpy.context.scene).to_dict(),
@@ -100,6 +112,12 @@ class Config:
 
         sc.Game_Path = data["PaksDirectory"]
         sc.exportPath = data.get("ExportPath") or self.ExportPath
+        try:
+            sc.mappings_path = data.get("MappingsPath") or self.MappingsPath
+        except:
+            pass
+
+        sc.ue_platform = data["Platform"]
 
         version = data["UEVersion"]
         if re.search(r"(game_ue\d_\d+)", version, re.IGNORECASE):
@@ -114,6 +132,7 @@ class Config:
         sc.bExportToDDSWhenPossible = data["bExportToDDSWhenPossible"]
         sc.bExportHiddenObjects = data.get("bExportHiddenObjects", False)
         sc.bExportBuildingFoundations = data["bExportBuildingFoundations"]
+        sc.bExportLandscapeOnly = data.get("bExportLandscapeOnly", False)
         sc.package = data["ExportPackage"]
 
         sc.dpklist.clear()
@@ -142,6 +161,10 @@ class Config:
             opt = sc.custom_options[i]
             opt.name = x
             opt.value = data["OptionsOverrides"][x]
+
+        self.bUseOverridePackageVersions = data.get("bUsePackageVersion", False)
+        self.OverrideUE4 = data.get("FileVersion", {}).get("FileVersionUE4", 0)
+        self.OverrideUE5 = data.get("FileVersion", {}).get("FileVersionUE5", 0)
 
         # load textures
         for i in range(1, 5):

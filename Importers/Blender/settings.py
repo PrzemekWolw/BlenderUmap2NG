@@ -14,15 +14,15 @@ class BlenderUmapPreferences(AddonPreferences): # TODO: Finished it
         default=""
     )
 
-    bUseExperimentalPskImporter: bpy.props.BoolProperty(
-        name="Use experimental PSK importer",
-        description="Faster but could import corrupted meshes",
-        default=False
+    bMultiProcessImport: bpy.props.BoolProperty(
+        name="Allow Multi Process Import of Sub Levels",
+        description="Multiple blender instances will be spawned to import sub levels.",
+        default=True
     )
 
     def draw(self, context: bpy.types.Context):
         layout: UILayout = self.layout
-        layout.prop(self, "bUseExperimentalPskImporter")
+        layout.prop(self, "bMultiProcessImport")
         layout.prop(self, "filepath")
         fp = context.preferences.addons[__package__].preferences.get("filepath")
         if fp is not None and fp != "" and not os.path.exists(fp):

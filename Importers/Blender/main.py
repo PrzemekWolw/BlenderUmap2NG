@@ -1,15 +1,23 @@
 import typing
 import bpy
 from bpy.props import StringProperty, IntProperty, CollectionProperty, BoolProperty
+from bpy_extras.io_utils import ImportHelper
 import json
 import os
 from urllib.request import urlopen, Request
-import subprocess
-import sys
 
 from bpy.types import Context
 from .config import Config
 from .texture import textures_to_mapping
+from .utils import (
+    get_addon_version,
+    get_addon_branch,
+    message_box,
+    run_exporter,
+    blender_version_check_draw,
+)
+
+from . import export
 
 try:
     from .umap import import_umap, cleanup
@@ -18,14 +26,24 @@ except ImportError:
 
 classes = []
 
+
 def register_class(cls):
     classes.append(cls)
     return cls
 
+
 def config_file_exists():
     return os.path.isfile(os.path.join(bpy.context.scene.exportPath, "config.json"))
 
-def main(context, onlyimport=False):
+
+# requires cleanup ik ik
+def main(
+    context,
+    onlyimport=False,
+    child_comp_import_callback=None,
+    autosave=True,
+    override_processed_map_path=None,
+):
     sc = bpy.context.scene
     reuse_maps = sc.reuse_maps
     reuse_meshes = sc.reuse_mesh
@@ -33,52 +51,25 @@ def main(context, onlyimport=False):
     use_generic_shader = sc.use_generic_shader
     use_generic_shader_as_fallback = sc.use_generic_shader_as_fallback
     data_dir = sc.exportPath
-    addon_dir = os.path.dirname(os.path.splitext(__file__)[0])
 
     if not onlyimport:
         Config().dump(sc.exportPath)
-        exporter = os.path.join(addon_dir, "BlenderUmap")
-        addon_prefs = context.preferences.addons[__package__].preferences
-        if addon_prefs.filepath != "":
-            exporter = addon_prefs.filepath
-        if sys.platform == "win32" and not exporter.endswith(".exe"):
-            executable = exporter.replace(r"\\", "/") + ".exe"
-            cmd = []
-        else:
-            executable = exporter.replace(r"\\", "/")
-            cmd = []
-
-        env_vars = os.environ.copy()
-        env_vars["PATH"] = f"{sc.exportPath};" + env_vars["PATH"]
-
-        subprocess.run(
-            cmd,
-            executable=executable,
-            capture_output=False,
-            shell=False,
-            check=True,
-            cwd=data_dir.replace(r"\\", "/"),
-            env=env_vars
-        )
+        if run_exporter(context, data_dir) != 0:
+            return {"CANCELLED"}
 
     tex_shader = None
     if use_generic_shader or use_generic_shader_as_fallback:
         uvm = bpy.data.node_groups.get("UV Shader Mix")
         tex_shader = bpy.data.node_groups.get("Texture Shader")
 
-        if not uvm or not tex_shader: # do we need this anymore?
+        if not uvm or not tex_shader:  # do we need this anymore?
             create_node_groups()
             uvm = bpy.data.node_groups.get("UV Shader Mix")
             tex_shader = bpy.data.node_groups.get("Texture Shader")
 
     # append all the node groups from blend files in the deps folder
     shader_folder = os.path.join(data_dir, "shader")
-    if os.path.exists(shader_folder):
-        for shaderfile in os.listdir(shader_folder):
-            if shaderfile.endswith(".blend"):
-                print("Appending node groups from " + shaderfile)
-                with bpy.data.libraries.load(os.path.join(data_dir, "shader", shaderfile)) as (data_from, data_to):
-                    data_to.node_groups = data_from.node_groups
+    import_shaders(shader_folder)
 
     # make sure we're on main scene to deal with the fallback objects
     main_scene = bpy.data.scenes.get("Scene") or bpy.data.scenes.new("Scene")
@@ -98,7 +89,7 @@ def main(context, onlyimport=False):
         import_collection = bpy.data.collections.new("Imported")
         main_scene.collection.children.link(import_collection)
 
-    cleanup()
+    # cleanup()
 
     # setup fallback cube mesh
     bpy.ops.mesh.primitive_cube_add(size=2)
@@ -111,11 +102,12 @@ def main(context, onlyimport=False):
     empty_mesh = bpy.data.meshes.get("__empty", bpy.data.meshes.new("__empty"))
 
     # do it!
-    with open(os.path.join(data_dir, "processed.json")) as file:
+    if override_processed_map_path:
         import time
+
         stime = time.time()
         import_umap(
-            json.loads(file.read()),
+            override_processed_map_path,
             import_collection,
             data_dir,
             reuse_maps,
@@ -124,17 +116,59 @@ def main(context, onlyimport=False):
             use_generic_shader,
             use_generic_shader_as_fallback,
             tex_shader,
-            textures_to_mapping(bpy.context)
+            textures_to_mapping(sc),
+            child_comp_import_callback,
+            autosave,
         )
         print(f"Imported in {time.time() - stime} seconds")
+    else:
+        with open(os.path.join(data_dir, "processed.json")) as file:
+            import time
+
+            stime = time.time()
+            import_umap(
+                json.loads(file.read()),
+                import_collection,
+                data_dir,
+                reuse_maps,
+                reuse_meshes,
+                use_cube_as_fallback,
+                use_generic_shader,
+                use_generic_shader_as_fallback,
+                tex_shader,
+                textures_to_mapping(sc),
+                child_comp_import_callback,
+                autosave,
+            )
+            print(f"Imported in {time.time() - stime} seconds")
 
     # go back to main scene
     bpy.context.window.scene = main_scene
     cleanup()
 
+def import_shaders(shader_folder):
+    if os.path.exists(shader_folder):
 
-class UE4Version:  # idk why
-    """Supported UE4 Versions"""
+        # # scene is totally empty add a cube without linking
+        # if len(bpy.context.scene.objects) == 0:
+        #     data = bpy.data.meshes.new("Cubeumapflbk")
+        #     obj = bpy.data.objects.new("CubeUmapflbk", data)
+
+        for shaderfile in os.listdir(shader_folder):
+            if shaderfile.endswith(".blend"):
+                print("Appending node groups from " + shaderfile)
+                with bpy.data.libraries.load(os.path.join(shader_folder, shaderfile)) as (data_from, data_to):
+                    for node_group in data_from.node_groups:
+                        if node_group not in bpy.data.node_groups:
+                            data_to.node_groups.append(node_group)
+
+
+class UEInfo:  # idk why
+    platforms = (
+        ("DesktopMobile", "Desktop / Mobile", "Desktop / Mobile"),
+        ("Playstation", "Playstation 4/5", "Playstation 4/5"),
+        ("NintendoSwitch", "Nintendo Switch", "Nintendo Switch"),
+    )
 
     Versions = (
         ("GAME_UE4_0", "GAME_UE4_0", ""),
@@ -168,11 +202,15 @@ class UE4Version:  # idk why
         ("GAME_UE5_0", "GAME_UE5_0", ""),
         ("GAME_UE5_1", "GAME_UE5_1", ""),
         ("GAME_UE5_2", "GAME_UE5_2", ""),
+        ("GAME_UE5_3", "GAME_UE5_3", ""),
+        ("GAME_UE5_4", "GAME_UE5_4", ""),
     )
+
 
 @register_class
 class VIEW3D_MT_AdditionalOptions(bpy.types.Menu):
     bl_label = "Additional Options"
+    bl_idname = "VIEW3D_MT_AdditionalOptions"
 
     def draw(self, context):
         layout = self.layout
@@ -181,11 +219,10 @@ class VIEW3D_MT_AdditionalOptions(bpy.types.Menu):
         col.operator("umap.fillfortnitekeys", depress=False)
         col.operator("umap.downloadmappings", depress=False)
 
-try:
-    from .__version__ import __version__
-    version = ".".join(__version__.split(".")[:2])
-except:
-    version = "0"
+
+version = get_addon_version()
+branch = get_addon_branch()
+
 
 # UI
 class BlenderUmapPanel(bpy.types.Panel):
@@ -195,36 +232,65 @@ class BlenderUmapPanel(bpy.types.Panel):
     bl_context = "objectmode"
 
 
+imported_shaders = False
+
+from bpy.app.handlers import persistent
+
+@persistent
+def load_handler(dummy):
+    global imported_shaders
+    imported_shaders = False
+
+bpy.app.handlers.load_post.append(load_handler)
+
 @register_class
 class VIEW3D_PT_BlenderUmapMain(BlenderUmapPanel):
     """Creates a Panel in Properties(N)"""
 
-    bl_label = f"BlenderUmap2 (v{version})"
+    bl_label = f"BlenderUmap2 (v{version}.{branch})"
     bl_idname = "VIEW3D_PT_BlenderUmapMain"
-
-    bpy.types.Scene.ue4_versions = bpy.props.EnumProperty(
-        name="UE Version", items=UE4Version.Versions
-    )
 
     def draw(self, context):
         layout = self.layout
 
-        col = layout.column(align=True, heading="Exporter Settings:")
+        if blender_version_check_draw(layout):
+            return
 
-        if config_file_exists():
-            col.operator(
-                "umap.load_configs", icon="FILE_REFRESH", text="Reload Last Used Config"
-            )
+        layout.label(text="Exporter Settings:")
+        col = layout.column(align=True, ) # heading="Exporter Settings:"
+
+        # if config_file_exists():
+        #     col.operator(
+        #         "umap.load_configs", icon="FILE_REFRESH", text="Reload Last Used Config"
+        #     )
+        col_conf = col.column(align=True, )
+        col_conf.prop(context.scene, "exportPath")
+
+        row_save = col_conf.row(align=True)
+        op = row_save.operator("umap.load_configs", icon="IMPORT", text="Load Saved Config")
+        row_save.operator("umap.dumpconfig", text="Save", icon="FILE_TICK")
+
+        col.separator()
 
         col.prop(context.scene, "Game_Path")
+        col.prop(context.scene, "mappings_path")
+
+        col.separator()
         col.prop(context.scene, "aeskey")
-        col.prop(context.scene, "exportPath")
         col.label(text="Dynamic Keys:")
 
         row = col.row(align=True)
 
         col2 = row.column(align=True)
-        col2.template_list("VIEW3D_UL_DPKLIST", "VIEW3D_UL_dpklist", context.scene, "dpklist", context.scene, "list_index", rows=3)
+        col2.template_list(
+            "VIEW3D_UL_DPKLIST",
+            "VIEW3D_UL_dpklist",
+            context.scene,
+            "dpklist",
+            context.scene,
+            "list_index",
+            rows=3,
+        )
         row.separator()
 
         col3 = row.column(align=True)
@@ -243,16 +309,19 @@ class VIEW3D_PT_BlenderUmapMain(BlenderUmapPanel):
 
         col.prop(context.scene, "package")
 
+        col.prop(context.scene, "bUseCustomEngineVer")
         if not context.scene.bUseCustomEngineVer:
             col.prop(context.scene, "ue4_versions")
-        col.prop(context.scene, "bUseCustomEngineVer")
         if context.scene.bUseCustomEngineVer:
             col.prop(context.scene, "customEngineVer")
 
+        col.prop(context.scene, "ue_platform")
+
         col.prop(context.scene, "readmats")
-        col.prop(context.scene, "bExportToDDSWhenPossible")
+        # col.prop(context.scene, "bExportToDDSWhenPossible")
         col.prop(context.scene, "bExportBuildingFoundations")
         col.prop(context.scene, "bExportHiddenObjects")
+        col.prop(context.scene, "bExportLandscapeOnly")
         col.prop(context.scene, "bdumpassets")
         col.prop(context.scene, "ObjectCacheSize")
         col.separator()
@@ -264,17 +333,34 @@ class VIEW3D_PT_BlenderUmapMain(BlenderUmapPanel):
         col.prop(context.scene, "use_generic_shader")
         if not context.scene.use_generic_shader:
             col.prop(context.scene, "use_generic_shader_as_fallback")
+            if not context.scene.use_generic_shader_as_fallback:
+                # import shaders first time only
+                global imported_shaders
+                if not imported_shaders and os.path.exists(os.path.join(context.scene.exportPath, "shader")):
+                    import_shaders(os.path.join(context.scene.exportPath, "shader"))
+                    imported_shaders = True
+
+                col.prop_search(context.scene, "fallback_shader", bpy.data, "node_groups")
 
         export_path_exists = os.path.exists(bpy.context.scene.exportPath)
         game_path_exists = os.path.exists(context.scene.Game_Path)
         import_col = col.column(align=True)
-        import_col.enabled = game_path_exists and export_path_exists
+
+        disabled_flag = True
+        if context.scene.package.strip() == "":
+            import_col.label(text="Package must be set", icon="ERROR")
+            disabled_flag = False
         if not game_path_exists:
             import_col.label(text="Game Path must exist", icon="ERROR")
+            disabled_flag = False
         if not export_path_exists:
             import_col.label(text="Export Path must exist", icon="ERROR")
+            disabled_flag = False
+
+        import_col.enabled = disabled_flag
+
         import_col.operator(
-            "umap.import",
+            "umap.importmap",
             text="Import",
             icon="IMPORT",
         )
@@ -285,6 +371,12 @@ class VIEW3D_PT_BlenderUmapMain(BlenderUmapPanel):
         if version == "0":
             col.operator("umap.dumpconfig", text="Dump Config", icon="DOWNARROW_HLT")
 
+        import_col.operator(
+            export.VIEW_PT_BeamExporter.bl_idname,
+            text="Export",
+            icon="IMPORT",
+        )
+
 
 @register_class
 class VIEW3D_PT_BlenderUmapTextureMappings(BlenderUmapPanel):
@@ -292,10 +384,14 @@ class VIEW3D_PT_BlenderUmapTextureMappings(BlenderUmapPanel):
 
     bl_label = f"Texture Mappings"
     bl_parent_id = "VIEW3D_PT_BlenderUmapMain"
-    bl_options = {'DEFAULT_CLOSED'}
+    bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
         layout = self.layout
+
+        if blender_version_check_draw(layout):
+            return
+
         layout.separator()
         col = layout.grid_flow(align=True, even_columns=True, even_rows=True)
 
@@ -311,13 +407,18 @@ class VIEW3D_PT_BlenderUmapTextureMappings(BlenderUmapPanel):
 class VIEW3D_PT_BlenderUmapAdvancedOptions(BlenderUmapPanel):
     bl_label = f"Advanced Options"
     bl_parent_id = "VIEW3D_PT_BlenderUmapMain"
-    bl_options = {'DEFAULT_CLOSED'}
+    bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
         layout = self.layout
 
+        if blender_version_check_draw(layout):
+            return
+
         # warning only change if you know what you are doing
-        layout.label(text="Warning: Only change if you know what you are doing", icon="ERROR")
+        layout.label(
+            text="Warning: Only change if you know what you are doing", icon="ERROR"
+        )
 
         col = layout.column(align=True)
         col.label(text="Options Overrides:")
@@ -327,8 +428,15 @@ class VIEW3D_PT_BlenderUmapAdvancedOptions(BlenderUmapPanel):
             row = col.row(align=True)
 
             col2 = row.column(align=True)
-            col2.template_list("VIEW3D_UL_CustomOptions", "custom_options_list", context.scene,
-                            "custom_options", context.scene, "custom_options_index", rows=3)
+            col2.template_list(
+                "VIEW3D_UL_CustomOptions",
+                "custom_options_list",
+                context.scene,
+                "custom_options",
+                context.scene,
+                "custom_options_index",
+                rows=3,
+            )
 
             row.separator()
 
@@ -336,20 +444,120 @@ class VIEW3D_PT_BlenderUmapAdvancedOptions(BlenderUmapPanel):
             col3.operator("custom_options.new_item", icon="ADD", text="")
             col3.operator("custom_options.delete_item", icon="REMOVE", text="")
 
+        # Package Version Override stuff
+        col.separator()
+        col = col.column(align=True, heading="Package Version Overrides:")
+        col.prop(
+            context.scene, "bOverridePackageVersion", text="Override Package Version"
+        )
+        if context.scene.bOverridePackageVersion:
+            col.prop(
+                context.scene, "overridePackageVersionUE4", text="UE4 Package Version"
+            )
+            col.prop(context.scene, "overridePackageVersionUE5")
+
+
+# @register_class
+# class VIEW3D_PT_BlenderUmapTools(BlenderUmapPanel):
+#     bl_label = f"Tools"
+#     bl_parent_id = "VIEW3D_PT_BlenderUmapMain"
+#     bl_options = {"DEFAULT_CLOSED"}
+
+#     def draw(self, context):
+#         layout = self.layout
+
+#         col = layout.column(align=True)
+
+#         # Merge Landscape Maps
+#         merge = col.operator(
+#             "umap.merge_landscape_maps",
+#             text="Merge Multiple Landscape Maps",
+#             icon="MOD_BOOLEAN",
+#         )
+#         if not os.path.exists(
+#             os.path.join(bpy.context.scene.exportPath, "processed.json")
+#         ):
+#             merge.enabled = False
+
+
+# # merge_landscape_maps
+# @register_class
+# class VIEW_PT_MergeLandscapeMaps(bpy.types.Operator, ImportHelper):
+#     bl_idname = "umap.merge_landscape_maps"
+#     bl_label = "Merge Multiple Landscape Maps"
+#     bl_description = "Merge landscape maps (heightmaps/weightmaps) into one image."
+
+#     @classmethod
+#     def poll(cls, context):
+#         return True
+
+#     def execute(self, context):
+#         # open blender folder select dialog
+#         filename, extension = os.path.splitext(self.filepath)
+#         if extension != "":
+#             self.report(
+#                 {"ERROR"},
+#                 "Please select a folder where you want to save the merged maps",
+#             )
+#             return {"CANCELLED"}
+
+#         data_dir = bpy.context.scene.exportPath
+
+#         processed_json = os.path.join(data_dir, "processed.json")
+#         if not os.path.exists(processed_json):
+#             self.report({"ERROR"}, "processed.json not found")
+#             return {"CANCELLED"}
+
+#         with open(processed_json) as file:
+#             processed_map_path = json.loads(file.read())
+
+#         with open(
+#             os.path.join(data_dir, "jsons" + processed_map_path + ".processed.json")
+#         ) as file:
+#             comps = json.loads(file.read())
+
+#         class Texture:
+#             def __init__(self, path, location):
+#                 self.path = path
+#                 self.location = location
+#                 self.full_path = os.path.join(data_dir, path)
+
+
+#         def collect_comps(comps):
+#             result = []
+#             for comp in comps:
+#                 mesh_path = comp[2]
+#                 location = comp[5] or [0, 0, 0]
+#                 child_comps = comp[8]
+
+#                 if mesh_path.startswith("/"): mesh_path = mesh_path[1:]
+
+#                 if child_comps is not None and len(child_comps) > 0:
+#                     result.extend(collect_comps(child_comps))
+#                 result.append(Texture(mesh_path, location))
+#             return result
+
+#         textures = collect_comps(comps)
+
+#         Min_X = 0
+#         Min_Y = 0
+#         Max_X = 0
+#         Max_Y = 0
+
+#         for texture in textures:
+#             pass
+
+#         return {"FINISHED"}
+
 
 @register_class
 class CustomOptionsListItem(bpy.types.PropertyGroup):
     """Group of properties representing an item in the list."""
 
-    name: StringProperty(
-           name="Name",
-           description="",
-           default="key")
+    name: StringProperty(name="Name", description="", default="key")
 
-    value: BoolProperty(
-           name="True",
-           description="",
-           default=False)
+    value: BoolProperty(name="True", description="", default=False)
+
 
 @register_class
 class VIEW3D_UL_CustomOptions(bpy.types.UIList):
@@ -362,9 +570,16 @@ class VIEW3D_UL_CustomOptions(bpy.types.UIList):
             split = layout.split(factor=0.6)
             split.prop(item, "name", text="", emboss=True)
             split.separator()
-            split.prop(item, "value", text= "True" if item.value else "False", toggle=0, emboss=True)
+            split.prop(
+                item,
+                "value",
+                text="True" if item.value else "False",
+                toggle=0,
+                emboss=True,
+            )
         elif self.layout_type in {"GRID"}:
             pass
+
 
 @register_class
 class CustomOptions_OT_NewItem(bpy.types.Operator):
@@ -377,6 +592,7 @@ class CustomOptions_OT_NewItem(bpy.types.Operator):
         context.scene.custom_options.add()
         context.scene.custom_options_index + 1
         return {"FINISHED"}
+
 
 @register_class
 class CustomOptions_OT_DeleteItem(bpy.types.Operator):
@@ -393,19 +609,23 @@ class CustomOptions_OT_DeleteItem(bpy.types.Operator):
         custom_options = context.scene.custom_options
         index = context.scene.custom_options_index
         custom_options.remove(index)
-        context.scene.custom_options_index = min(max(0, index - 1), len(custom_options) - 1)
+        context.scene.custom_options_index = min(
+            max(0, index - 1), len(custom_options) - 1
+        )
         return {"FINISHED"}
+
 
 @register_class
 class VIEW_PT_UmapOperator(bpy.types.Operator):
     """Import Umap"""
 
-    bl_idname = "umap.import"
+    bl_idname = "umap.importmap"
     bl_label = "Umap Exporter"
 
     def execute(self, context):
-        main(context)
+        main(context, False)
         return {"FINISHED"}
+
 
 @register_class
 class VIEW_PT_UmapOnlyImport(bpy.types.Operator):
@@ -414,26 +634,21 @@ class VIEW_PT_UmapOnlyImport(bpy.types.Operator):
     bl_idname = "umap.onlyimport"
     bl_label = "Umap Import"
 
-    def execute(self, context):
-        main(context, True)
-        return {"FINISHED"}
-
-# dump config operator
-@register_class
-class VIEW_PT_UmapDumpConfig(bpy.types.Operator):
-    """Dump config to file"""
-
-    bl_idname = "umap.dumpconfig"
-    bl_label = "Dump Config"
-
-    @classmethod
-    def poll(cls, context):
-        return config_file_exists()
+    auto_save: BoolProperty(default=True)
+    override_processed_map_path: StringProperty(default="")
 
     def execute(self, context):
-        print("Dumping config to file")
-        Config().dump(context.scene.exportPath)
+        main(
+            context,
+            True,
+            None,
+            self.auto_save,
+            self.override_processed_map_path
+            if self.override_processed_map_path != ""
+            else None,
+        )
         return {"FINISHED"}
+
 
 @register_class
 class Fortnite(bpy.types.Operator):
@@ -494,6 +709,7 @@ class Fortnite(bpy.types.Operator):
 
         return {"FINISHED"}
 
+
 @register_class
 class FortniteMappings(bpy.types.Operator):
     bl_idname = "umap.downloadmappings"
@@ -504,21 +720,22 @@ class FortniteMappings(bpy.types.Operator):
         return True  # TODO check if machine is connected to internet
 
     def execute(self, context):
-        self.check_mappings()
-        return {"FINISHED"}
+        return self.check_mappings()
 
     def check_mappings(self):
         path = bpy.context.scene.exportPath
         mappings_path = os.path.join(path, "mappings")
         if not os.path.exists(mappings_path):
             os.makedirs(mappings_path)
-            self.dl_mappings(mappings_path)
-            return True
+            return self.dl_mappings(mappings_path)
         try:
-            self.dl_mappings(mappings_path)
+            return self.dl_mappings(mappings_path)
         except:
-            pass
-        return True
+            self.report(
+                {"ERROR"},
+                "Failed to download mappings. Please select a valid mappings file manually",
+            )
+            return {"CANCELLED"}
 
     def dl_mappings(self, path):
         ENDPOINT = "https://fortnitecentral.genxgames.gg/api/v1/mappings"
@@ -546,13 +763,22 @@ class FortniteMappings(bpy.types.Operator):
                 break
 
         import hashlib
+
         filepath = os.path.join(path, data["fileName"])
-        if not os.path.exists(filepath) or data["hash"] != hashlib.sha1(open(filepath, "rb").read()).hexdigest():
+        if (
+            not os.path.exists(filepath)
+            or data["hash"] != hashlib.sha1(open(filepath, "rb").read()).hexdigest()
+        ):
             with open(filepath, "wb") as f:
                 downfile = urlopen(Request(url=data["url"], headers=headers))
                 print("Downloading", data["fileName"])
                 f.write(downfile.read(downfile.length))
-        return True
+                self.report({"INFO"}, f"Downloaded {data['fileName']}")
+        else:
+            self.report({"INFO"}, f"Using cached {data['fileName']}")
+        bpy.context.scene.mappings_path = filepath
+        return {"FINISHED"}
+
 
 @register_class
 class ListItem(bpy.types.PropertyGroup):
@@ -568,6 +794,7 @@ class ListItem(bpy.types.PropertyGroup):
         default="",
         maxlen=32,
     )
+
 
 @register_class
 class VIEW3D_UL_DPKLIST(bpy.types.UIList):
@@ -589,6 +816,7 @@ class VIEW3D_UL_DPKLIST(bpy.types.UIList):
             else:
                 layout.label(text=item.pakname)
 
+
 @register_class
 class DPKLIST_OT_NewItem(bpy.types.Operator):
     """Add a new item to the list."""
@@ -600,6 +828,7 @@ class DPKLIST_OT_NewItem(bpy.types.Operator):
         context.scene.dpklist.add()
         context.scene.list_index + 1
         return {"FINISHED"}
+
 
 @register_class
 class DPKLIST_OT_DeleteItem(bpy.types.Operator):
@@ -619,11 +848,16 @@ class DPKLIST_OT_DeleteItem(bpy.types.Operator):
         context.scene.list_index = min(max(0, index - 1), len(dpklist) - 1)
         return {"FINISHED"}
 
+
 @register_class
 class LOAD_Configs(bpy.types.Operator):
     bl_label = "Load Config from File"
     bl_idname = "umap.load_configs"
     bl_description = "Load Configs from File"
+
+    @classmethod
+    def poll(self, context):
+        return config_file_exists()
 
     def execute(
         self, context: "Context"
@@ -634,6 +868,39 @@ class LOAD_Configs(bpy.types.Operator):
             self.report({"ERROR"}, str(e))
             return {"CANCELLED"}
         return {"FINISHED"}
+
+
+
+# dump config operator
+@register_class
+class VIEW_PT_UmapDumpConfig(bpy.types.Operator):
+    """Dump config to file"""
+
+    bl_idname = "umap.dumpconfig"
+    bl_label = "Dump Config"
+
+    @classmethod
+    def poll(cls, context):
+        sc = context.scene
+        return sc.exportPath != "" and sc.Game_Path != "" and os.path.exists(sc.exportPath)
+
+    def execute(self, context):
+        print("Dumping config to file")
+        create_node_groups()
+        Config().dump(context.scene.exportPath)
+        return {"FINISHED"}
+
+
+classes.append(export.VIEW_PT_BeamExporter)
+
+def verify_mappings_file(self, context):
+    if not os.path.exists(context.scene.mappings_path):
+        message_box("Mappings file does not exist", "Mappings", "ERROR")
+        return
+    usmap_header = 0x30C4
+    with open(context.scene.mappings_path, "rb") as f:
+        if int.from_bytes(f.read(2), "little") != usmap_header:
+            message_box("Mappings file is invalid", "Mappings", "ERROR")
 
 
 def create_node_groups():
@@ -713,16 +980,28 @@ def create_node_groups():
         uvm.links.new(m2_3.outputs[0], mix_2.inputs[0])
         uvm.links.new(m2_4.outputs[0], mix_3.inputs[0])
 
+
         # I/O
         g_in = uvm.nodes.new("NodeGroupInput")
-        uvm.inputs.new("NodeSocketColor", "Color")
-        uvm.inputs.new("NodeSocketShader", "Shader")
-        uvm.inputs.new("NodeSocketShader", "Shader")
-        uvm.inputs.new("NodeSocketShader", "Shader")
-        uvm.inputs.new("NodeSocketShader", "Shader")
+        if bpy.app.version >= (4, 0, 0):
+            uvm.interface.new_socket(name="Color", in_out='INPUT', socket_type='NodeSocketColor')
+            uvm.interface.new_socket(name="Mix1", in_out='INPUT', socket_type='NodeSocketShader')
+            uvm.interface.new_socket(name="Mix2", in_out='INPUT', socket_type='NodeSocketShader')
+            uvm.interface.new_socket(name="Mix3", in_out='INPUT', socket_type='NodeSocketShader')
+            uvm.interface.new_socket(name="Mix4", in_out='INPUT', socket_type='NodeSocketShader')
+        else:
+            uvm.inputs.new("NodeSocketColor", "Color")
+            uvm.inputs.new("NodeSocketShader", "Shader")
+            uvm.inputs.new("NodeSocketShader", "Shader")
+            uvm.inputs.new("NodeSocketShader", "Shader")
+            uvm.inputs.new("NodeSocketShader", "Shader")
 
         g_out = uvm.nodes.new("NodeGroupOutput")
-        uvm.outputs.new("NodeSocketShader", "Shader")
+        if bpy.app.version >= (4, 0, 0):
+            uvm.interface.new_socket(name="Shader", in_out='OUTPUT', socket_type='NodeSocketShader')
+        else:
+            uvm.outputs.new("NodeSocketShader", "Shader")
+
         g_in.location = [-1700, 220]
         g_out.location = [300, 300]
         uvm.links.new(g_in.outputs[0], sep.inputs[0])
@@ -743,16 +1022,44 @@ def create_node_groups():
 
         g_in = tex_shader.nodes.new("NodeGroupInput")
         g_out = tex_shader.nodes.new("NodeGroupOutput")
-        tex_shader.outputs.new("NodeSocketShader", "Shader")
         g_in.location = [-700, 0]
         g_out.location = [350, 300]
+
+
+        if bpy.app.version >= (4, 0, 0):
+            tex_shader.interface.new_socket(name="Shader", in_out='OUTPUT', socket_type='NodeSocketShader')
+
+            tex_shader.interface.new_socket(name="Diffuse", in_out='INPUT', socket_type='NodeSocketColor')
+            norm = tex_shader.interface.new_socket(name="Normal", in_out='INPUT', socket_type='NodeSocketColor')
+            spec = tex_shader.interface.new_socket(name="Specular", in_out='INPUT', socket_type='NodeSocketColor')
+            emis = tex_shader.interface.new_socket(name="Emission", in_out='INPUT', socket_type='NodeSocketColor')
+            alpha = tex_shader.interface.new_socket(name="Alpha", in_out='INPUT', socket_type='NodeSocketColor')
+
+            norm.default_value = [0.5, 0.5, 1, 1]
+            spec.default_value = [0.5, 0, 0.5, 1]
+            emis.default_value = [0, 0, 0, 1]
+            alpha.default_value = [1, 0, 0, 1]
+
+        else:
+            tex_shader.outputs.new("NodeSocketShader", "Shader")
+
+            tex_shader.inputs.new("NodeSocketColor", "Diffuse")
+            tex_shader.inputs.new("NodeSocketColor", "Normal")
+            tex_shader.inputs.new("NodeSocketColor", "Specular")
+            tex_shader.inputs.new("NodeSocketColor", "Emission")
+            tex_shader.inputs.new("NodeSocketColor", "Alpha")
+
+            tex_shader.inputs[1].default_value = [0.5, 0.5, 1, 1]
+            tex_shader.inputs[2].default_value = [0.5, 0, 0.5, 1]
+            tex_shader.inputs[3].default_value = [0, 0, 0, 1]
+            tex_shader.inputs[4].default_value = [1, 0, 0, 1]
+
 
         principled_bsdf = tex_shader.nodes.new(type="ShaderNodeBsdfPrincipled")
         principled_bsdf.location = [50, 300]
         tex_shader.links.new(principled_bsdf.outputs[0], g_out.inputs[0])
 
         # diffuse
-        tex_shader.inputs.new("NodeSocketColor", "Diffuse")
         tex_shader.links.new(g_in.outputs[0], principled_bsdf.inputs["Base Color"])
 
         # normal
@@ -764,20 +1071,18 @@ def create_node_groups():
         norm_curve.mapping.curves[1].points[0].location = [0, 1]
         norm_curve.mapping.curves[1].points[1].location = [1, 0]
 
-        tex_shader.inputs.new("NodeSocketColor", "Normal")
         tex_shader.links.new(g_in.outputs[1], norm_curve.inputs[1])
         tex_shader.links.new(norm_curve.outputs[0], norm_map.inputs[1])
         tex_shader.links.new(norm_map.outputs[0], principled_bsdf.inputs["Normal"])
-        tex_shader.inputs[1].default_value = [0.5, 0.5, 1, 1]
 
         # specular
-        tex_shader.inputs.new("NodeSocketColor", "Specular")
         spec_y = 140
         spec_separate_rgb = tex_shader.nodes.new("ShaderNodeSeparateRGB")
         spec_separate_rgb.location = [-200, spec_y]
         tex_shader.links.new(g_in.outputs[2], spec_separate_rgb.inputs[0])
+
         tex_shader.links.new(
-            spec_separate_rgb.outputs[0], principled_bsdf.inputs["Specular"]
+            spec_separate_rgb.outputs[0], principled_bsdf.inputs["Specular IOR Level" if bpy.app.version >= (4, 0, 0) else "Specular"]
         )
         tex_shader.links.new(
             spec_separate_rgb.outputs[1], principled_bsdf.inputs["Metallic"]
@@ -785,28 +1090,24 @@ def create_node_groups():
         tex_shader.links.new(
             spec_separate_rgb.outputs[2], principled_bsdf.inputs["Roughness"]
         )
-        tex_shader.inputs[2].default_value = [0.5, 0, 0.5, 1]
 
         # emission
-        tex_shader.inputs.new("NodeSocketColor", "Emission")
-        tex_shader.links.new(g_in.outputs[3], principled_bsdf.inputs["Emission"])
-        tex_shader.inputs[3].default_value = [0, 0, 0, 1]
+        tex_shader.links.new(g_in.outputs[3], principled_bsdf.inputs["Emission Color" if bpy.app.version >= (4, 0, 0) else "Emission"])
 
         # alpha
-        tex_shader.inputs.new("NodeSocketColor", "Alpha")
         alpha_separate_rgb = tex_shader.nodes.new("ShaderNodeSeparateRGB")
         alpha_separate_rgb.location = [-200, -180]
         tex_shader.links.new(g_in.outputs[4], alpha_separate_rgb.inputs[0])
         tex_shader.links.new(
             alpha_separate_rgb.outputs[0], principled_bsdf.inputs["Alpha"]
         )
-        tex_shader.inputs[4].default_value = [1, 0, 0, 1]
 
         # tex_shader.inputs[0].name = "Diffuse"
         # tex_shader.inputs[1].name = "Normal"
         # tex_shader.inputs[2].name = "Specular"
         # tex_shader.inputs[3].name = "Emission"
         # tex_shader.inputs[4].name = "Alpha"
+
 
 def register():
     for cls in classes:
@@ -832,9 +1133,17 @@ def register():
         subtype="DIR_PATH",
     )
 
+    bpy.types.Scene.mappings_path = StringProperty(
+        name="Mappings Path",
+        description="Path to the mappings file (.usmap)",
+        subtype="FILE_PATH",
+        update=verify_mappings_file,
+    )
+
     bpy.types.Scene.aeskey = StringProperty(
         name="Main AES Key",
         description="AES key",
+        default="0x0000000000000000000000000000000000000000000000000000000000000000",
         subtype="NONE",
     )
 
@@ -855,6 +1164,35 @@ def register():
         name="Custom Engine Version", description="Custom UE4 Version"
     )
 
+    bpy.types.Scene.bOverridePackageVersion = BoolProperty(
+        name="Override Package Version",
+        description="Override Package Version",
+        default=False,
+        subtype="NONE",
+    )
+
+    bpy.types.Scene.overridePackageVersionUE4 = IntProperty(
+        name="Override Package Version UE4",
+        description="Override Package Version UE4",
+        default=0,
+        subtype="NONE",
+    )
+
+    bpy.types.Scene.overridePackageVersionUE5 = IntProperty(
+        name="Override Package Version UE5",
+        description="Override Package Version UE5",
+        default=0,
+        subtype="NONE",
+    )
+
+    bpy.types.Scene.ue4_versions = bpy.props.EnumProperty(
+        name="UE Version", items=UEInfo.Versions
+    )
+
+    bpy.types.Scene.ue_platform = bpy.props.EnumProperty(
+        name="Platform", items=UEInfo.platforms
+    )
+
     bpy.types.Scene.readmats = BoolProperty(
         name="Read Materials",
         description="Import Materials",
@@ -873,6 +1211,13 @@ def register():
         name="Export Building Foundations",
         description="You can turn off exporting sub-buildings in large POIs if you want to quickly port the base POI structures, by setting this to false",
         default=True,
+        subtype="NONE",
+    )
+
+    bpy.types.Scene.bExportLandscapeOnly = BoolProperty(
+        name="Export Landscape Only",
+        description="Only export landscape actors",
+        default=False,
         subtype="NONE",
     )
 
@@ -932,6 +1277,13 @@ def register():
         subtype="NONE",
     )
 
+    bpy.types.Scene.fallback_shader = StringProperty(
+        name="Fallback Shader",
+        description="Fallback Shader",
+        default="",
+        subtype="NONE",
+    )
+
     bpy.types.Scene.exportPath = StringProperty(
         name="Export Path",
         description="Path to Export Folder",
@@ -949,7 +1301,6 @@ def register():
 
 
 def unregister():
-
     for cls in classes:
         bpy.utils.unregister_class(cls)
 
@@ -957,9 +1308,13 @@ def unregister():
     del sc.Game_Path
     del sc.aeskey
     del sc.package
+    del sc.mappings_path
+    del sc.ue4_versions
+    del sc.ue_platform
     del sc.readmats
     del sc.bExportToDDSWhenPossible
     del sc.bExportBuildingFoundations
+    del sc.bExportLandscapeOnly
     del sc.bExportHiddenObjects
     del sc.bdumpassets
     del sc.ObjectCacheSize
@@ -968,8 +1323,12 @@ def unregister():
     del sc.use_cube_as_fallback
     del sc.use_generic_shader
     del sc.use_generic_shader_as_fallback
+    del sc.fallback_shader
     del sc.exportPath
     del sc.bUseCustomOptions
+    del sc.bOverridePackageVersion
+    del sc.overridePackageVersionUE4
+    del sc.overridePackageVersionUE5
 
 
 if __name__ == "__main__":

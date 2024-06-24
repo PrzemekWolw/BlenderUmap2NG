@@ -1,1 +1,0 @@
-modified version of [this](https://github.com/DarklightGames/io_scene_psk_psa/tree/master/io_scene_psk_psa/psk).
